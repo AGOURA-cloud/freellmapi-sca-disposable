@@ -1,0 +1,111 @@
+# RESEARCH TEMPLATE. NOT INSTALLED OR ACTIVATED.
+# User authorized a separate disposable public repository and one manual audit run.
+# This file alone does not start any workflow; explicit manual dispatch is required.
+# Run ONLY in a new PUBLIC repository containing NO NOVA source, access tokens, or secrets.
+name: AI-D0G metadata-only patched lockfile experiment
+on:
+  push:
+    paths:
+      - 'AI_D0G_LAUNCH.txt'
+permissions: {}
+concurrency:
+  group: freellmapi-research-sca
+  cancel-in-progress: true
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 14
+    env:
+      NPM_CONFIG_IGNORE_SCRIPTS: 'true'
+      NPM_CONFIG_FUND: 'false'
+      NPM_CONFIG_UPDATE_NOTIFIER: 'false'
+    steps:
+      - name: Fetch a fixed, public, untrusted source snapshot (no install)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir source
+          git -C source init -q
+          git -C source remote add origin https://github.com/tashfeenahmed/freellmapi.git
+          git -C source fetch --depth=1 --no-tags origin 9d2b4b407b12e489ecd35320cd630d5ff97cd666
+          git -C source checkout -q --detach FETCH_HEAD
+          test "$(git -C source rev-parse HEAD)" = 9d2b4b407b12e489ecd35320cd630d5ff97cd666
+          test "$(git -C source hash-object package-lock.json)" = 1ee6ad8e90aa6288ccc4e03402c63f11e5f7a537
+          echo "Pinned source and lockfile hash match. No upstream scripts run."
+      - name: Copy manifests and update four direct server dependency ranges
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p candidate/{server,client,cli,shared} result
+          cp source/package.json source/package-lock.json candidate/
+          for x in server client cli shared; do cp "source/$x/package.json" "candidate/$x/package.json"; done
+          node <<'NODE'
+          const fs=require('fs'), f='candidate/server/package.json', p=JSON.parse(fs.readFileSync(f,'utf8'));
+          const fixes={undici:['^6.21.0','^6.29.1'],multer:['^2.2.0','^2.5.0'],compression:['^1.8.0','^1.8.2'],sharp:['^0.35.3','^0.35.5']};
+          for(const [k,v] of Object.entries(fixes)){if(p.dependencies?.[k]!==v[0])throw Error('Pinned source mismatch: '+k);p.dependencies[k]=v[1]}
+          fs.writeFileSync(f,JSON.stringify(p,null,2)+'\n');
+          fs.writeFileSync('result/patch-intent.json',JSON.stringify(fixes,null,2)+'\n');
+          NODE
+          test ! -e candidate/node_modules
+      - name: Resolve lockfile ONLY (no package installation or scripts)
+        id: lock
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd candidate
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org > ../result/resolve.log 2> ../result/resolve-stderr.log
+          test ! -e node_modules
+          cp package-lock.json ../result/patch-package-lock.json
+          cp server/package.json ../result/patch-server.json
+          sha256sum package-lock.json > ../result/patch-sha256.txt
+      - name: Audit patched graph with and without dev dependencies
+        if: steps.lock.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd candidate
+          set +e
+          npm audit --json --audit-level=low --ignore-scripts --registry=https://registry.npmjs.org > ../result/audit-full.json 2> ../result/audit-full-stderr.log
+          a=$?
+          npm audit --omit=dev --json --audit-level=low --ignore-scripts --registry=https://registry.npmjs.org > ../result/audit-prod.json 2> ../result/audit-prod-stderr.log
+          b=$?
+          set -e
+          echo "$a" > ../result/audit-full-exit.txt
+          echo "$b" > ../result/audit-prod-exit.txt
+          test ! -e node_modules
+      - name: Fail-closed metadata summary
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p result
+          node <<'NODE'
+          const fs=require('fs'),read=f=>{try{return JSON.parse(fs.readFileSync(f,'utf8'))}catch{return null}};
+          const lock=read('result/patch-package-lock.json');
+          const counts=x=>{const c=x?.metadata?.vulnerabilities;return x?.auditReportVersion===2&&x?.vulnerabilities&&c&&['critical','high','moderate','low','info','total'].every(k=>Number.isInteger(c[k]))?c:null};
+          const full=counts(read('result/audit-full.json')),prod=counts(read('result/audit-prod.json'));
+          const floor={undici:'6.29.1',multer:'2.5.0',compression:'1.8.2',sharp:'0.35.5'};
+          const actual=Object.fromEntries(Object.keys(floor).map(k=>[k,lock?.packages?.['node_modules/'+k]?.version??null]));
+          const met=(v,f)=>{if(!v||!/^[0-9]+\.[0-9]+\.[0-9]+$/.test(v))return false;const a=v.split('.').map(Number),b=f.split('.').map(Number);return a[0]===b[0]&&(a[1]>b[1]||(a[1]===b[1]&&a[2]>=b[2]));};
+          const floorsMet=Object.keys(floor).every(k=>met(actual[k],floor[k])),noModules=!fs.existsSync('candidate/node_modules');
+          const complete=!!(full&&prod&&floorsMet&&noModules);
+          const result=!complete?'METADATA_INCOMPLETE_NO_GO':(full.total>0||prod.total>0)?'ADVISORIES_REMAIN_NO_GO':'NO_ADVISORIES_BUT_RUNTIME_NOT_TESTED';
+          const summary={result,sourceCommit:'9d2b4b407b12e489ecd35320cd630d5ff97cd666',
+            sourceLockBlob:'1ee6ad8e90aa6288ccc4e03402c63f11e5f7a537',floor,actual,floorsMet,full,prod,noModules,
+            thirdPartyPackagesInstalled:false,FreeLLMAPICodeExecuted:false,NOVAIntegrationApproved:false};
+          fs.writeFileSync('result/summary.json',JSON.stringify(summary,null,2)+'\n');
+          console.log('AI-D0G',JSON.stringify(summary));
+          NODE
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ai-d0g-patched-lockfile-metadata-evidence
+          path: result/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Fail closed until no known advisories (never grants integration)
+        if: always()
+        shell: bash
+        run: |
+          node -e "const x=require('./result/summary.json');if(x.result!=='NO_ADVISORIES_BUT_RUNTIME_NOT_TESTED')process.exit(3); console.log('Metadata clean; application has not been installed or tested.');"
