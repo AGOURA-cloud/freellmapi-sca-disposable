@@ -1,1 +1,0 @@
-Authorized AI-D0H metadata-only lockfile experiment. Research only, pinned public FreeLLMAPI, no install or NOVA access.
