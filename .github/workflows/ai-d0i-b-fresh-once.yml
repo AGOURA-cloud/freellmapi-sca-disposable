@@ -1,0 +1,108 @@
+# Temporary AI-D0I-B source-metadata-only resolver experiment; no upstream installation.
+name: AI-D0I-B fresh lockfile scoped override feasibility
+on:
+  push:
+    paths:
+      - 'AI_D0I_B_LAUNCH.txt'
+permissions: {}
+concurrency:
+  group: ai-d0i-b-once
+  cancel-in-progress: true
+jobs:
+  resolver-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      NPM_CONFIG_IGNORE_SCRIPTS: 'true'
+      NPM_CONFIG_FUND: 'false'
+      NPM_CONFIG_UPDATE_NOTIFIER: 'false'
+    steps:
+      - name: Verify immutable upstream public manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir source
+          git -C source init -q
+          git -C source remote add origin https://github.com/tashfeenahmed/freellmapi.git
+          git -C source fetch --depth=1 --no-tags origin 9d2b4b407b12e489ecd35320cd630d5ff97cd666
+          git -C source checkout -q --detach FETCH_HEAD
+          test "$(git -C source rev-parse HEAD)" = 9d2b4b407b12e489ecd35320cd630d5ff97cd666
+          test "$(git -C source hash-object package-lock.json)" = 1ee6ad8e90aa6288ccc4e03402c63f11e5f7a537
+      - name: Resolve two fresh metadata-only graphs, without original lockfile
+        id: resolve
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir result
+          for variant in unmodified-scope scoped-minimatch; do
+            mkdir -p "$variant"/{server,shared,client,cli}
+            cp source/package.json "$variant/"
+            for w in server shared client cli; do cp "source/$w/package.json" "$variant/$w/"; done
+            VARIANT="$variant" node <<'NODE'
+          const fs=require('fs'),x=process.env.VARIANT;
+          const sf=x+'/server/package.json',sp=JSON.parse(fs.readFileSync(sf,'utf8'));
+          const fixes={undici:['^6.21.0','^6.29.1'],multer:['^2.2.0','^2.5.0'],compression:['^1.8.0','^1.8.2'],sharp:['^0.35.3','^0.35.5']};
+          for(const [k,[a,b]] of Object.entries(fixes)){if(sp.dependencies?.[k]!==a)throw Error('source mismatch '+k);sp.dependencies[k]=b}
+          fs.writeFileSync(sf,JSON.stringify(sp,null,2)+'\n');
+          if(x==='scoped-minimatch'){
+            const f=x+'/package.json',p=JSON.parse(fs.readFileSync(f,'utf8'));
+            if(p.overrides)throw Error('unexpected upstream overrides');
+            p.overrides={'@ts-morph/common':{'minimatch':'11.0.1'}};
+            fs.writeFileSync(f,JSON.stringify(p,null,2)+'\n');
+          }
+          NODE
+            (
+              cd "$variant"
+              code=0
+              npm install --package-lock-only --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org > ../result/"$variant"-resolve.log 2> ../result/"$variant"-resolve-errors.log || code=$?
+              echo "$code" > ../result/"$variant"-resolve-exit.txt
+              test ! -e node_modules
+              if test -f package-lock.json; then
+                cp package-lock.json ../result/"$variant"-package-lock.json
+                sha256sum package-lock.json > ../result/"$variant"-sha256.txt
+                code=0
+                npm audit --json --ignore-scripts --audit-level=low --registry=https://registry.npmjs.org > ../result/"$variant"-full-audit.json 2> ../result/"$variant"-full-errors.log || code=$?
+                echo "$code" > ../result/"$variant"-audit-exit.txt
+              fi
+            )
+          done
+      - name: Compare exact versions and resulting audit counts
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p result
+          node <<'NODE'
+          const fs=require('fs'),read=f=>{try{return JSON.parse(fs.readFileSync(f,'utf8'))}catch{return null}};
+          function counts(v){const c=v?.metadata?.vulnerabilities,k=['info','low','moderate','high','critical','total'];return v?.auditReportVersion===2&&v?.vulnerabilities&&c&&k.every(x=>Number.isInteger(c[x]))?c:null}
+          const result={upstreamCommit:'9d2b4b407b12e489ecd35320cd630d5ff97cd666',testedScope:'FRESH FULL LOCKFILE; source manifests + four patched server direct deps; root scoped minimatch override in one variant',NOVAUnchanged:true,FreeLLMAPINotExecuted:true,thirdPartyPackagesInstalled:false,variants:{}};
+          for(const v of ['unmodified-scope','scoped-minimatch']){
+            const lock=read('result/'+v+'-package-lock.json'),audit=counts(read('result/'+v+'-full-audit.json'));
+            const names=Object.entries(lock?.packages||{}).filter(([k])=>k.endsWith('node_modules/minimatch')).map(([path,data])=>({path,version:data.version}));
+            const original=lock?.packages?.['node_modules/shadcn']?.version??null;
+            result.variants[v]={hasLock:!!lock,audit,shadcnVersion:original,minimatchInstances:names,
+              pathCommon:names.filter(x=>x.path.includes('@ts-morph/common'))};
+          }
+          const a=result.variants['unmodified-scope'],b=result.variants['scoped-minimatch'];
+          const noModules=['unmodified-scope','scoped-minimatch'].every(v=>!fs.existsSync(v+'/node_modules'));
+          result.noNodeModules=noModules;
+          result.scopedOverrideWorks=!!(a.audit&&b.audit&&a.shadcnVersion===b.shadcnVersion&&
+            b.pathCommon.length>0&&b.pathCommon.every(x=>x.version==='11.0.1')&&b.audit.total===0&&noModules);
+          result.result=result.scopedOverrideWorks?'SCOPED_OVERRIDE_METADATA_FIXED_BUT_RUNTIME_UNTESTED':'OVERRIDE_NOT_VALIDATED_NO_GO';
+          fs.writeFileSync('result/summary.json',JSON.stringify(result,null,2)+'\n');
+          console.log('AI_D0I_B_RESULT',JSON.stringify(result));
+          NODE
+      - name: Save evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ai-d0i-b-fresh-resolver-evidence
+          path: result/
+          retention-days: 7
+          if-no-files-found: warn
+      - name: Fail closed; never approve application use
+        if: always()
+        shell: bash
+        run: |
+          node -e "const r=require('./result/summary.json');if(!r.scopedOverrideWorks)process.exit(3);console.log('Only metadata passed; no runtime, provider or NOVA approval.');"
