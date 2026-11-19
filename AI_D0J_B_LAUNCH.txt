@@ -1,1 +1,0 @@
-Approved continuation of AI-D0J in disposable repo. Exact audited AI-D0I lockfile SHA pinned; read-only temporary artifact token only in preflight; npm ci --ignore-scripts; offline isolated Docker tests; NOVA untouched.
