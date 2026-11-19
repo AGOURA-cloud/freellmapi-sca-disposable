@@ -1,1 +1,0 @@
-One-time approved AI-D0J: publicly pinned source, ephemeral Docker install with scripts disabled, test with network NONE, no NOVA access. No ongoing trigger.
