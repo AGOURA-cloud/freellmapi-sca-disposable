@@ -1,1 +1,2 @@
 One-time, no-secrets, no-network-localhost-gateway integration smoke only. No live AI, no NOVA modification.
+AI-D0N-B corrected offline no-network-gateway verification one-shot. No credentials, no live provider, no production writes.
