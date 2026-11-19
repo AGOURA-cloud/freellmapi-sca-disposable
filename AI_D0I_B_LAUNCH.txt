@@ -1,0 +1,1 @@
+One-time fresh lockfile scope test, no npm packages installed, no NOVA source or production.
