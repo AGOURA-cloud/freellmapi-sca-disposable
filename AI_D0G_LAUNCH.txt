@@ -1,2 +1,0 @@
-One-time approved AI-D0G METADATA-ONLY lockfile candidate and npm audit.
-Pinned public source; no package installation, no upstream app execution, no NOVA changes.
