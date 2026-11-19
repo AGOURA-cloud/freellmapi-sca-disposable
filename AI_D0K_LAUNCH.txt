@@ -1,1 +1,0 @@
-AI-D0K one-time local-only security regression: pinned public source; zero-advisory patched lockfile; offline authentication/MCP/CORS/host/rate-limit tests. No provider calls, no NOVA access.
