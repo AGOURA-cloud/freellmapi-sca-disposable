@@ -1,12 +1,12 @@
-name: AI-D0J-B exact audited lockfile isolated compatibility
+name: AI-D0J-C corrected smoke isolated compatibility
 on:
   push:
     paths:
-      - 'AI_D0J_B_LAUNCH.txt'
+      - 'AI_D0J_C_LAUNCH.txt'
 permissions:
   actions: read
 concurrency:
-  group: ai-d0j-b-exact-lock-one-shot
+  group: ai-d0j-c-smoke-correction-once
   cancel-in-progress: true
 jobs:
   test:
@@ -101,8 +101,8 @@ jobs:
           const {Project}=require('ts-morph');
           const p=new Project({useInMemoryFileSystem:true});
           if(p.createSourceFile('test.ts','export const x: number = 42;').getVariableStatements().length!==1)throw Error('ts-morph in-memory AST failure');
-          if(require('./node_modules/shadcn/package.json').version!=='4.23.0'||!fs.existsSync('node_modules/shadcn/tailwind.css'))throw Error('shadcn CSS or version failure');
-          console.log('PASS minimatch 11, ts-morph AST, shadcn CSS');
+          if(require('./node_modules/shadcn/package.json').version!=='4.23.0')throw Error('shadcn version mismatch');
+          console.log('PASS minimatch 11, ts-morph AST, shadcn package version; stylesheet verified separately by client build');
           NODE
           box() {
             local name="$1"; shift
