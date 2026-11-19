@@ -1,4 +1,0 @@
-ONE-TIME USER-APPROVED PUBLIC DEPENDENCY SECURITY AUDIT
-Scope: pinned FreeLLMAPI public revision 9d2b4b407b12e489ecd35320cd630d5ff97cd666
-No NOVA files, credentials, installation or paid services.
-The push-event workflow is scoped to this exact file.
