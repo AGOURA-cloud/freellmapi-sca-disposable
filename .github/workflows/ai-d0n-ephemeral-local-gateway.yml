@@ -1,0 +1,216 @@
+name: AI-D0N one-shot offline localhost gateway readiness
+on:
+  push:
+    paths:
+      - 'AI_D0N_LAUNCH.txt'
+permissions:
+  actions: read
+concurrency:
+  group: ai-d0n-one-shot-localhost-gateway
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 28
+    steps:
+      - name: Rebuild and verify pinned metadata-only zero-advisory candidate
+        id: candidate
+        continue-on-error: true
+        shell: bash
+        env:
+          READONLY_ACTIONS_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir source result
+          git -C source init -q
+          git -C source remote add origin https://github.com/tashfeenahmed/freellmapi.git
+          git -C source fetch --depth=1 --no-tags origin 9d2b4b407b12e489ecd35320cd630d5ff97cd666
+          git -C source checkout -q --detach FETCH_HEAD
+          test "$(git -C source rev-parse HEAD)" = 9d2b4b407b12e489ecd35320cd630d5ff97cd666
+          test "$(git -C source hash-object package-lock.json)" = 1ee6ad8e90aa6288ccc4e03402c63f11e5f7a537
+          curl -fLsS --retry 3 -H "Authorization: Bearer $READONLY_ACTIONS_TOKEN" \
+            https://api.github.com/repos/AGOURA-cloud/freellmapi-sca-disposable/actions/artifacts/14529460580/zip \
+            --output result/verified-d0i-b-artifact.zip
+          unzip -p result/verified-d0i-b-artifact.zip scoped-minimatch-package-lock.json > source/package-lock.json
+          echo 'dc7799e8134eb428d38857b6392b9cb499784416cebd0e9b6fe179091138da36  source/package-lock.json' | sha256sum -c -
+          rm result/verified-d0i-b-artifact.zip
+          node <<'NODE'
+          const fs=require('fs'),s='source/server/package.json',p=JSON.parse(fs.readFileSync(s,'utf8'));
+          const fixes={undici:['^6.21.0','^6.29.1'],multer:['^2.2.0','^2.5.0'],compression:['^1.8.0','^1.8.2'],sharp:['^0.35.3','^0.35.5']};
+          for(const [k,[a,b]] of Object.entries(fixes)){if(p.dependencies[k]!==a)throw Error('Pinned source mismatch '+k);p.dependencies[k]=b}
+          fs.writeFileSync(s,JSON.stringify(p,null,2)+'\n');
+          const f='source/package.json',root=JSON.parse(fs.readFileSync(f,'utf8'));
+          if(root.overrides)throw Error('Unexpected override in upstream');
+          root.overrides={'@ts-morph/common':{minimatch:'11.0.1'}};
+          fs.writeFileSync(f,JSON.stringify(root,null,2)+'\n');
+          NODE
+          cd source
+          echo 'dc7799e8134eb428d38857b6392b9cb499784416cebd0e9b6fe179091138da36  package-lock.json' | sha256sum -c -
+          test ! -e node_modules
+          set +e
+          npm audit --json --ignore-scripts --audit-level=low --registry=https://registry.npmjs.org > ../result/audit.json 2> ../result/audit-errors.log
+          rc=$?
+          set -e
+          echo "$rc" > ../result/audit-exit.txt
+          node <<'NODE'
+          const fs=require('fs'),j=JSON.parse(fs.readFileSync('../result/audit.json','utf8'));
+          if(j.auditReportVersion!==2||!j.vulnerabilities||j.metadata?.vulnerabilities?.total!==0)throw Error('Audit findings remain, block runtime');
+          NODE
+          test "$rc" = 0
+          echo PASS > ../result/candidate-gate.txt
+      - name: Fetch official Node build container and record digest
+        id: image
+        if: steps.candidate.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull node:24.22.1-bookworm > result/docker-pull.log 2>&1
+          docker image inspect node:24.22.1-bookworm --format '{{index .RepoDigests 0}}' > result/image-digest.txt
+          test -s result/image-digest.txt
+      - name: Install public packages with ALL lifecycle scripts disabled in disposable container
+        id: install
+        if: steps.image.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          timeout -k 10s 720s docker run --rm --network bridge --read-only \
+            --cap-drop ALL --security-opt no-new-privileges --pids-limit 256 \
+            --memory 4g --cpus 2 --user "$(id -u):$(id -g)" \
+            --tmpfs /tmp:rw,nosuid,size=2048m \
+            -v "$PWD/source:/workspace:rw" -w /workspace \
+            -e HOME=/tmp -e CI=true -e NPM_CONFIG_IGNORE_SCRIPTS=true \
+            node:24.22.1-bookworm \
+            bash -lc 'npm ci --ignore-scripts --no-audit --no-fund --cache /tmp/npm-cache --registry=https://registry.npmjs.org' > result/npm-ci.log 2>&1
+          rc=$?
+          set -e
+          echo "$rc" > result/npm-ci-exit.txt
+          test "$rc" = 0 && test -d source/node_modules
+      - name: Build and probe isolated local gateway without external network
+        id: gateway
+        if: steps.install.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > source/ai-d0n-gateway-probe.mjs <<'NODE'
+          import crypto from 'node:crypto';
+          import { spawn } from 'node:child_process';
+          import { setTimeout as sleep } from 'node:timers/promises';
+          const PORT=31827, base='http://127.0.0.1:'+PORT;
+          const email='synthetic-probe@example.test',password=crypto.randomBytes(20).toString('hex');
+          const env={...process.env,NODE_ENV:'production',PORT:String(PORT),HOST:'127.0.0.1',
+           FREEAPI_DB_PATH:'/tmp/ai-d0n-offline-freeapi.db',ENCRYPTION_KEY:crypto.randomBytes(32).toString('hex'),
+           ALLOWED_HOSTS:'localhost,127.0.0.1',TRUST_PROXY:'false',FREEAPI_BLOCK_PRIVATE_PROVIDER_URLS:'true',
+           FREEAPI_DESKTOP:'0',CLOUDFLARE_NEURON_ANALYTICS:'0',COOLDOWN_PROBE_DISABLED:'1',
+           FREELLMAPI_UPDATE_CHECK:'off',RESPONSE_CACHE:'off'};
+          const child=spawn(process.execPath,['server/dist/index.js'],{cwd:process.cwd(),env,stdio:'ignore'});
+          let earlyExit=null; child.on('exit',(code,signal)=>{earlyExit=String(code)+'/'+String(signal)});
+          let count=0;
+          async function req(path,options={}) {
+           const r=await fetch(base+path,{...options,signal:AbortSignal.timeout(4000)});
+           const text=await r.text();let body;try{body=JSON.parse(text)}catch{}
+           return {status:r.status,body};
+          }
+          const data=(method,obj,headers={})=>({method,headers:{'Content-Type':'application/json',...headers},body:JSON.stringify(obj)});
+          async function test(name,fn){if(!await fn())throw Error('FAILED_CHECK '+name);count++;console.log('PASS '+name)}
+          try {
+           let started=false;
+           for(let i=0;i<120;i++){
+             if(earlyExit!==null)throw Error('SERVER_EXITED_BEFORE_START');
+             try{const r=await req('/api/ping');if(r.status===200&&r.body?.status==='ok'){started=true;break}}catch{}
+             await sleep(300);
+           }
+           if(!started)throw Error('STARTUP_TIMEOUT');
+           await test('01_loopback_ping',async()=> (await req('/api/ping')).status===200);
+           await test('02_db_and_encryption_liveness',async()=> (await req('/livez')).status===200);
+           await test('03_unconfigured_upstream_not_ready',async()=>{let r=await req('/readyz');return r.status===503&&r.body?.reason==='no_upstreams_configured'});
+           await test('04_admin_session_required',async()=> (await req('/api/keys')).status===401);
+           await test('05_v1_key_required',async()=> (await req('/v1/models')).status===401);
+           await test('06_dns_rebinding_host_rejected',async()=> (await req('/api/ping',{headers:{Host:'attacker.invalid'}})).status===403);
+           await test('07_initial_setup_available',async()=>{let r=await req('/api/auth/status');return r.status===200&&r.body?.needsSetup===true});
+           await test('08_desktop_signin_not_available',async()=> (await req('/api/auth/desktop-session',data('POST',{}))).status===403);
+           await test('09_mcp_disabled_initially',async()=> (await req('/mcp',data('POST',{jsonrpc:'2.0',id:1,method:'initialize'}))).status===403);
+           let session;
+           await test('10_disposable_local_dashboard_setup',async()=>{let r=await req('/api/auth/setup',data('POST',{email,password}));session=r.body?.token;return r.status===201&&typeof session==='string'&&session.length>15});
+           const dashboard={Authorization:'Bearer '+session};
+           await test('11_repeated_setup_rejected',async()=> (await req('/api/auth/setup',data('POST',{email,password}))).status===409);
+           await test('12_auth_status_authenticated',async()=>{let r=await req('/api/auth/status',{headers:dashboard});return r.status===200&&r.body?.authenticated===true});
+           await test('13_wrong_password_rejected',async()=> (await req('/api/auth/login',data('POST',{email,password:'wrong-password'}))).status===401);
+           await test('14_correct_password_allowed',async()=>{let r=await req('/api/auth/login',data('POST',{email,password}));return r.status===200&&typeof r.body?.token==='string'});
+           await test('15_authorized_admin_allowed',async()=> (await req('/api/keys',{headers:dashboard})).status===200);
+           await test('16_initial_mcp_setting_false',async()=>{let r=await req('/api/settings/enable-mcp',{headers:dashboard});return r.status===200&&r.body?.enabled===false});
+           await test('17_ephemeral_mcp_enable',async()=>{let r=await req('/api/settings/enable-mcp',data('PUT',{enabled:true},dashboard));return r.status===200&&r.body?.enabled===true});
+           await test('18_enabled_mcp_missing_key_rejected',async()=> (await req('/mcp',data('POST',{jsonrpc:'2.0',id:1,method:'initialize'}))).status===401);
+           await test('19_enabled_mcp_wrong_key_rejected',async()=> (await req('/mcp',data('POST',{jsonrpc:'2.0',id:1,method:'initialize'},{Authorization:'Bearer fake'}))).status===401);
+           let key;
+           await test('20_admin_only_local_unified_key_retrieval',async()=>{let r=await req('/api/settings/api-key',{headers:dashboard});key=r.body?.apiKey;return r.status===200&&typeof key==='string'&&key.length>12});
+           const mcpAuth={Authorization:'Bearer '+key};
+           await test('21_mcp_authenticated_initialize',async()=>{let r=await req('/mcp',data('POST',{jsonrpc:'2.0',id:2,method:'initialize',params:{protocolVersion:'2025-06-18',capabilities:{},clientInfo:{name:'test',version:'0.1'}}},mcpAuth));return r.status===200&&r.body?.result?.serverInfo?.name==='freellmapi'});
+           await test('22_mcp_auth_tools_list_observed',async()=>{let r=await req('/mcp',data('POST',{jsonrpc:'2.0',id:3,method:'tools/list',params:{}},mcpAuth));const names=(r.body?.result?.tools||[]).map(x=>x.name);return r.status===200&&['ask_freellmapi','list_models','clear_cache','set_routing_strategy'].every(x=>names.includes(x))});
+           await test('23_mcp_batch_rejected',async()=> (await req('/mcp',data('POST',[{jsonrpc:'2.0',id:4,method:'initialize'}],mcpAuth))).status===400);
+           await test('24_mcp_stateless_get_405',async()=> (await req('/mcp',{headers:mcpAuth})).status===405);
+           await test('25_ephemeral_mcp_disable',async()=>{let r=await req('/api/settings/enable-mcp',data('PUT',{enabled:false},dashboard));return r.status===200&&r.body?.enabled===false});
+           await test('26_mcp_reclosed',async()=> (await req('/mcp',data('POST',{jsonrpc:'2.0',id:5,method:'initialize'},mcpAuth))).status===403);
+           console.log('FINAL_GATEWAY_CHECKS_PASSED '+count);
+          } catch(e) {
+           console.error('OFFLINE_LOCAL_GATEWAY_FAILED '+String(e?.message||'unknown')+' completed='+count);
+           process.exitCode=1;
+          } finally {
+           child.kill('SIGTERM');await sleep(600);if(child.exitCode===null)child.kill('SIGKILL');
+          }
+                    NODE
+          set +e
+          timeout -k 10s 580s docker run --rm --network none --read-only \
+            --cap-drop ALL --security-opt no-new-privileges --pids-limit 256 \
+            --memory 4g --cpus 2 --user "$(id -u):$(id -g)" \
+            --tmpfs /tmp:rw,nosuid,size=1024m \
+            -v "$PWD/source:/workspace:rw" -w /workspace \
+            -e HOME=/tmp -e CI=true -e CLOUDFLARE_NEURON_ANALYTICS=0 \
+            -e NODE_OPTIONS=--max-old-space-size=3072 \
+            node:24.22.1-bookworm bash -lc \
+            'node --check ai-d0n-gateway-probe.mjs && npm run build -w server && npm rebuild better-sqlite3 --offline --foreground-scripts --build-from-source --nodedir=/usr/local && node ai-d0n-gateway-probe.mjs' \
+            > result/offline-gateway.log 2>&1
+          rc=$?
+          set -e
+          echo "$rc" > result/offline-gateway-exit.txt
+          echo "Offline local gateway exit: $rc"
+          exit 0
+      - name: Summarize offline local gateway readiness
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p result
+          node <<'NODE'
+          const fs=require('fs');
+          const read=n=>{try{return fs.readFileSync('result/'+n,'utf8')}catch{return ''}};
+          const log=read('offline-gateway.log');
+          const exit=read('offline-gateway-exit.txt').trim();
+          const passed=log.split('\n').filter(x=>/^PASS \d\d_/.test(x)).length;
+          let audit=null;try{audit=JSON.parse(read('audit.json')).metadata.vulnerabilities}catch{}
+          const good=exit==='0'&&passed===26&&log.includes('FINAL_GATEWAY_CHECKS_PASSED 26')&&read('candidate-gate.txt').trim()==='PASS'&&read('npm-ci-exit.txt').trim()==='0'&&audit?.total===0;
+          const s={phase:'AI-D0N',sourceSha:'9d2b4b407b12e489ecd35320cd630d5ff97cd666',
+           auditedLockSHA256:'dc7799e8134eb428d38857b6392b9cb499784416cebd0e9b6fe179091138da36',
+           offlineGatewayExit:exit||'NOT_RUN',passedHttpMcpChecks:passed,expectedChecks:26,
+           audit,localhostOnly:true,outboundNetworkDisabled:true,providerKeysUsed:0,realInferenceCalls:0,
+           liveFreeTierVerified:false,FreeLLMAPIProviderConnected:false,productionNOVAUnaffected:true,
+           result:good?'ISOLATED_GATEWAY_HTTP_MCP_PASS_NO_EXTERNAL_INFERENCE':'FAILED_OR_INCOMPLETE_GATEWAY_NO_GO',
+           NOVAIntegrationApproved:false};
+          fs.writeFileSync('result/summary.json',JSON.stringify(s,null,2)+'\n');
+          console.log('AI-D0N summary',JSON.stringify(s));
+          NODE
+      - name: Upload results, security evidence, and test logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ai-d0n-offline-local-gateway-readiness
+          path: result/
+          retention-days: 7
+          if-no-files-found: warn
+      - name: Fail closed unless all offline local checks passed
+        if: always()
+        shell: bash
+        run: |
+          node -e "const s=require('./result/summary.json');if(s.NOVAIntegrationApproved||s.result!=='ISOLATED_GATEWAY_HTTP_MCP_PASS_NO_EXTERNAL_INFERENCE')process.exit(3);console.log('Ephemeral local gateway checks PASS. Live inference and NOVA integration remain blocked.');"
