@@ -96,6 +96,7 @@ jobs:
           set -euo pipefail
           cat > source/ai-d0n-gateway-probe.mjs <<'NODE'
           import crypto from 'node:crypto';
+          import http from 'node:http';
           import { spawn } from 'node:child_process';
           import { setTimeout as sleep } from 'node:timers/promises';
           const PORT=31827, base='http://127.0.0.1:'+PORT;
@@ -113,6 +114,17 @@ jobs:
            const text=await r.text();let body;try{body=JSON.parse(text)}catch{}
            return {status:r.status,body};
           }
+          async function rawHostStatus(path, host) {
+           return await new Promise((resolve, reject) => {
+            const request=http.request({hostname:'127.0.0.1',port:PORT,path,headers:{Host:host},timeout:4000},response=>{
+             response.resume();
+             response.on('end',()=>resolve(response.statusCode??0));
+            });
+            request.on('timeout',()=>request.destroy(new Error('raw host timeout')));
+            request.on('error',reject);
+            request.end();
+           });
+          }
           const data=(method,obj,headers={})=>({method,headers:{'Content-Type':'application/json',...headers},body:JSON.stringify(obj)});
           async function test(name,fn){if(!await fn())throw Error('FAILED_CHECK '+name);count++;console.log('PASS '+name)}
           try {
@@ -128,7 +140,7 @@ jobs:
            await test('03_unconfigured_upstream_not_ready',async()=>{let r=await req('/readyz');return r.status===503&&r.body?.reason==='no_upstreams_configured'});
            await test('04_admin_session_required',async()=> (await req('/api/keys')).status===401);
            await test('05_v1_key_required',async()=> (await req('/v1/models')).status===401);
-           await test('06_dns_rebinding_host_rejected',async()=> (await req('/api/ping',{headers:{Host:'attacker.invalid'}})).status===403);
+           await test('06_dns_rebinding_host_rejected',async()=> (await rawHostStatus('/api/ping','attacker.invalid'))===403);
            await test('07_initial_setup_available',async()=>{let r=await req('/api/auth/status');return r.status===200&&r.body?.needsSetup===true});
            await test('08_desktop_signin_not_available',async()=> (await req('/api/auth/desktop-session',data('POST',{}))).status===403);
            await test('09_mcp_disabled_initially',async()=> (await req('/mcp',data('POST',{jsonrpc:'2.0',id:1,method:'initialize'}))).status===403);
