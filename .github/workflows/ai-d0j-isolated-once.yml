@@ -1,11 +1,12 @@
-name: AI-D0J isolated FreeLLMAPI compatibility
+name: AI-D0J-B exact audited lockfile isolated compatibility
 on:
   push:
     paths:
-      - 'AI_D0J_LAUNCH.txt'
-permissions: {}
+      - 'AI_D0J_B_LAUNCH.txt'
+permissions:
+  actions: read
 concurrency:
-  group: ai-d0j-isolated-once
+  group: ai-d0j-b-exact-lock-one-shot
   cancel-in-progress: true
 jobs:
   test:
@@ -16,6 +17,8 @@ jobs:
         id: candidate
         continue-on-error: true
         shell: bash
+        env:
+          READONLY_ACTIONS_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           mkdir source result
@@ -25,7 +28,12 @@ jobs:
           git -C source checkout -q --detach FETCH_HEAD
           test "$(git -C source rev-parse HEAD)" = 9d2b4b407b12e489ecd35320cd630d5ff97cd666
           test "$(git -C source hash-object package-lock.json)" = 1ee6ad8e90aa6288ccc4e03402c63f11e5f7a537
-          rm source/package-lock.json
+          curl -fLsS --retry 3 -H "Authorization: Bearer $READONLY_ACTIONS_TOKEN" \
+            https://api.github.com/repos/AGOURA-cloud/freellmapi-sca-disposable/actions/artifacts/14529460580/zip \
+            --output result/verified-d0i-b-artifact.zip
+          unzip -p result/verified-d0i-b-artifact.zip scoped-minimatch-package-lock.json > source/package-lock.json
+          echo 'dc7799e8134eb428d38857b6392b9cb499784416cebd0e9b6fe179091138da36  source/package-lock.json' | sha256sum -c -
+          rm result/verified-d0i-b-artifact.zip
           node <<'NODE'
           const fs=require('fs'),s='source/server/package.json',p=JSON.parse(fs.readFileSync(s,'utf8'));
           const fixes={undici:['^6.21.0','^6.29.1'],multer:['^2.2.0','^2.5.0'],compression:['^1.8.0','^1.8.2'],sharp:['^0.35.3','^0.35.5']};
@@ -37,7 +45,6 @@ jobs:
           fs.writeFileSync(f,JSON.stringify(root,null,2)+'\n');
           NODE
           cd source
-          npm install --package-lock-only --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org > ../result/lockfile-resolve.log 2> ../result/lockfile-resolve-errors.log
           echo 'dc7799e8134eb428d38857b6392b9cb499784416cebd0e9b6fe179091138da36  package-lock.json' | sha256sum -c -
           test ! -e node_modules
           set +e
