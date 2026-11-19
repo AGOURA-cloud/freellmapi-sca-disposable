@@ -1,0 +1,150 @@
+# AI-D0I: one-shot, PUBLIC metadata only. Do not run upstream scripts.
+name: AI-D0I scoped minimatch and isolated server dependency audit
+on:
+  push:
+    paths:
+      - 'AI_D0I_LAUNCH.txt'
+permissions: {}
+concurrency:
+  group: ai-d0i-one-shot
+  cancel-in-progress: true
+jobs:
+  validate-metadata:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    env:
+      NPM_CONFIG_IGNORE_SCRIPTS: 'true'
+      NPM_CONFIG_FUND: 'false'
+      NPM_CONFIG_UPDATE_NOTIFIER: 'false'
+    steps:
+      - name: Fetch and verify immutable public FreeLLMAPI revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir source
+          git -C source init -q
+          git -C source remote add origin https://github.com/tashfeenahmed/freellmapi.git
+          git -C source fetch --depth=1 --no-tags origin 9d2b4b407b12e489ecd35320cd630d5ff97cd666
+          git -C source checkout -q --detach FETCH_HEAD
+          test "$(git -C source rev-parse HEAD)" = 9d2b4b407b12e489ecd35320cd630d5ff97cd666
+          test "$(git -C source hash-object package-lock.json)" = 1ee6ad8e90aa6288ccc4e03402c63f11e5f7a537
+      - name: Rebuild previous four-fix baseline metadata; apply compatible lock-only updates
+        id: baseline
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p baseline/{shared,server,client,cli} result
+          cp source/package.json source/package-lock.json baseline/
+          for x in shared server client cli; do cp "source/$x/package.json" "baseline/$x/package.json"; done
+          node <<'NODE'
+          const fs=require('fs'),f='baseline/server/package.json',p=JSON.parse(fs.readFileSync(f,'utf8'));
+          const fixes={undici:['^6.21.0','^6.29.1'],multer:['^2.2.0','^2.5.0'],compression:['^1.8.0','^1.8.2'],sharp:['^0.35.3','^0.35.5']};
+          for(const [k,[before,after]] of Object.entries(fixes)){if(p.dependencies?.[k]!==before)throw Error('source mismatch '+k);p.dependencies[k]=after}
+          fs.writeFileSync(f,JSON.stringify(p,null,2)+'\n');
+          NODE
+          cd baseline
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org > ../result/baseline-resolve.log 2> ../result/baseline-resolve-errors.log
+          code=0
+          npm audit fix --package-lock-only --ignore-scripts --no-fund --registry=https://registry.npmjs.org > ../result/baseline-fix.log 2> ../result/baseline-fix-errors.log || code=$?
+          echo "$code" > ../result/baseline-fix-exit.txt
+          test ! -e node_modules
+          cp package-lock.json ../result/baseline-lock.json
+          cd ..
+          npm --version > result/npm-version.txt
+      - name: Test narrowly scoped transitive minimatch v11 override in metadata ONLY
+        id: override
+        if: steps.baseline.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp -a baseline override
+          node <<'NODE'
+          const fs=require('fs'),f='override/package.json',p=JSON.parse(fs.readFileSync(f,'utf8'));
+          if(p.overrides)throw Error('Unexpected upstream overrides');
+          p.overrides={'@ts-morph/common@0.27.0':{'minimatch':'11.0.1'}};
+          fs.writeFileSync(f,JSON.stringify(p,null,2)+'\n');
+          NODE
+          cd override
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org > ../result/override-resolve.log 2> ../result/override-resolve-errors.log
+          test ! -e node_modules
+          cp package-lock.json ../result/override-lock.json
+          cp package.json ../result/override-root-manifest.json
+          set +e
+          npm audit --json --ignore-scripts --audit-level=low --registry=https://registry.npmjs.org > ../result/override-full-audit.json 2> ../result/override-full-errors.log
+          a=$?
+          npm audit --omit=dev --json --ignore-scripts --audit-level=low --registry=https://registry.npmjs.org > ../result/override-prod-audit.json 2> ../result/override-prod-errors.log
+          b=$?
+          set -e
+          echo "$a" > ../result/override-full-exit.txt
+          echo "$b" > ../result/override-prod-exit.txt
+          sha256sum package-lock.json > ../result/override-sha256.txt
+      - name: Independently resolve SERVER and SHARED workspace manifests only
+        id: server
+        if: steps.baseline.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p server-only/{server,shared}
+          cp baseline/server/package.json server-only/server/
+          cp baseline/shared/package.json server-only/shared/
+          node <<'NODE'
+          const fs=require('fs'),p=JSON.parse(fs.readFileSync('source/package.json','utf8'));
+          const minimal={name:'freellmapi-research-server-only-manifests',private:true,workspaces:['shared','server'],engines:p.engines};
+          fs.writeFileSync('server-only/package.json',JSON.stringify(minimal,null,2)+'\n');
+          NODE
+          cd server-only
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org > ../result/server-resolve.log 2> ../result/server-resolve-errors.log
+          test ! -e node_modules
+          cp package-lock.json ../result/server-only-lock.json
+          cp package.json ../result/server-only-root.json
+          set +e
+          npm audit --omit=dev --json --ignore-scripts --audit-level=low --registry=https://registry.npmjs.org > ../result/server-only-prod-audit.json 2> ../result/server-only-prod-errors.log
+          a=$?
+          set -e
+          echo "$a" > ../result/server-only-prod-exit.txt
+          sha256sum package-lock.json > ../result/server-sha256.txt
+      - name: Compare results and block approval of untested application
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p result
+          node <<'NODE'
+          const fs=require('fs'),read=f=>{try{return JSON.parse(fs.readFileSync(f,'utf8'))}catch{return null}};
+          function counts(f){const r=read(f),c=r?.metadata?.vulnerabilities,keys=['info','low','moderate','high','critical','total'];return r?.auditReportVersion===2&&r.vulnerabilities&&c&&keys.every(k=>Number.isInteger(c[k])&&c[k]>=0)?c:null}
+          const baseline=read('result/baseline-lock.json'),over=read('result/override-lock.json'),server=read('result/server-only-lock.json');
+          const f=counts('result/override-full-audit.json'),o=counts('result/override-prod-audit.json'),s=counts('result/server-only-prod-audit.json');
+          const names=['shared','server','client','cli'];
+          const original=read('source/package.json'),overrideRoot=read('result/override-root-manifest.json');
+          const intended=!!(original&&overrideRoot&&JSON.stringify({...overrideRoot,overrides:undefined})===JSON.stringify(original));
+          const shadcnBefore=baseline?.packages?.['node_modules/shadcn']?.version??null,shadcnAfter=over?.packages?.['node_modules/shadcn']?.version??null;
+          const minimatchMatches=Object.entries(over?.packages||{}).filter(([k,v])=>k.endsWith('node_modules/minimatch')).map(([path,v])=>({path,version:v.version}));
+          const scopedMatches=minimatchMatches.filter(x=>x.path.includes('@ts-morph/common'));
+          const noMods=names.every(n=>!fs.existsSync('override/'+n+'/node_modules'))&&
+            !fs.existsSync('override/node_modules')&&!fs.existsSync('baseline/node_modules')&&
+            !fs.existsSync('server-only/node_modules');
+          const statuses={baselineExists:!!baseline,overrideValid:!!(over&&f&&o&&intended&&scopedMatches.some(x=>x.version==='11.0.1')&&shadcnAfter===shadcnBefore&&noMods),serverValid:!!(server&&s&&noMods)};
+          const result=(!statuses.overrideValid||!statuses.serverValid)?'EVIDENCE_INCOMPLETE_NO_GO':(f.total||o.total||s.total)?'ADVISORIES_REMAIN_NO_GO':'NO_REGISTRY_ADVISORIES_BUT_COMPATIBILITY_UNTESTED';
+          const summary={result,sourceCommit:'9d2b4b407b12e489ecd35320cd630d5ff97cd666',originalLockBlob:'1ee6ad8e90aa6288ccc4e03402c63f11e5f7a537',
+            scopedOverride:{'@ts-morph/common@0.27.0':{minimatch:'11.0.1'}},
+            shadcnBefore,shadcnAfter,minimatchMatches,scopedMatches,fullOverride:f,prodOverride:o,serverOnlyProd:s,
+            statuses,noNodeModules:noMods,thirdPartyPackagesInstalled:false,thirdPartyCodeExecuted:false,freeLLMAPICompatTested:false,NOVAIntegrationAllowed:false};
+          fs.writeFileSync('result/summary.json',JSON.stringify(summary,null,2)+'\n');
+          console.log('AI_D0I_RESULT',JSON.stringify({result,shadcnBefore,shadcnAfter,scopedMatches,fullOverride:f,prodOverride:o,serverOnlyProd:s,statuses}));
+          NODE
+      - name: Upload all metadata evidence even if rejected
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ai-d0i-final-chain-and-server-only-evidence
+          path: result/
+          retention-days: 7
+          if-no-files-found: warn
+      - name: Fail closed (runtime approval never granted here)
+        if: always()
+        shell: bash
+        run: |
+          node -e "const x=require('./result/summary.json');if(x.result!=='NO_REGISTRY_ADVISORIES_BUT_COMPATIBILITY_UNTESTED')process.exit(3);console.log('Registry metadata checked, application remains untested and unauthorized.');"
