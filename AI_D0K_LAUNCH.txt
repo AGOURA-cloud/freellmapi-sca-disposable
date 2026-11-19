@@ -1,0 +1,1 @@
+One time AI-D0K no-secrets security regression: actual pinned clean public candidate, script-disabled npm install, network-disabled tests, no external model calls, no NOVA access.
